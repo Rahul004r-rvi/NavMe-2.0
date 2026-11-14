@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "dashboard",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev:dashboard", "--prefix", "dashboard"],
+      "port": 3001
+    },
+    {
+      "name": "platform",
+      "runtimeExecutable": "C:\\Program Files\\Git\\bin\\bash.exe",
+      "runtimeArgs": ["-c", "cd platform && set -a && . ./.env.local && set +a && exec .venv/Scripts/python -m uvicorn wayfinding_api.main:app --app-dir api --host 127.0.0.1 --port 8780"],
+      "port": 8780
+    }
+  ]
+}
