@@ -8,8 +8,14 @@ Resilience, so coverage doesn't come down to luck on one run:
     behaviour) had no way to recover from either.
   - already-downloaded thumbnails are left alone, so re-running this step only backfills the gaps
     instead of re-downloading everything from scratch every time.
-  - a sweep that still has no skybox after retries (a real gap, not a transient failure) borrows its
-    nearest neighbour sweep's thumbnail instead of being left with nothing.
+  - a sweep that still has no skybox stays missing. A neighbour's photo is not
+    evidence of the requested location and must never be copied under its ID.
+
+New downloads have exact-source provenance in thumbs/provenance.json. Existing
+files without that provenance remain legacy place-card thumbnails; their sweep,
+model and viewing direction cannot safely be inferred from their filename.
+Face 1 is not necessarily the route's travel direction, so direction_verified is
+always false. Route images require separate verified directional evidence.
 
 A second, separate gap: admin-curated POIs (e.g. "HMD Room no.[333]") live in Supabase
 and are merged into the viewer's POI list live, client-side, at runtime — they never
@@ -18,12 +24,15 @@ candidate here, retries or not. _live_poi_sweep_ids() pulls that same Supabase P
 and snaps each one to the nearest sweep in nav_graph.json so those get covered too.
 
 Optional: failures only warn."""
-import json, os, time, urllib.request, urllib.error
+import hashlib, json, math, os, time, urllib.request, urllib.error
 from pathlib import Path
 import numpy as np, cv2
 from .fetch_mp import gql
 
-Q = 'query($id:ID!){model(id:$id){locations{id pano{skyboxes{resolution status urlTemplate}}}}}'
+Q = '''query($id:ID!){model(id:$id){locations{id floor{id} position{x y z}
+ pano{position{x y z} rotation{x y z w} skyboxes{resolution status urlTemplate}}}}}'''
+
+PROVENANCE_SCHEMA = "wayfinding.thumbnail-provenance/v1"
 
 RETRIES = 3
 RETRY_DELAY_S = 1.5
@@ -107,10 +116,14 @@ def fetch_thumb(loc, W, H, d):
     for attempt in range(RETRIES):
         try:
             b = urllib.request.urlopen(urllib.request.Request(u, headers={"User-Agent": "wayfinding-platform/0.1"}), timeout=30).read()
-            im = cv2.imdecode(np.frombuffer(b, np.uint8), 1); h, w = im.shape[:2]
+            im = cv2.imdecode(np.frombuffer(b, np.uint8), 1)
+            if im is None:
+                raise ValueError("skybox image could not be decoded")
+            h, w = im.shape[:2]
             sc = W / w; im = cv2.resize(im, (W, int(h * sc)), interpolation=cv2.INTER_AREA)
             y = max(0, (im.shape[0] - H) // 2); im = im[y:y + H]
-            cv2.imwrite(str(d / f"{loc['id']}.jpg"), im, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            if not cv2.imwrite(str(d / f"{loc['id']}.jpg"), im, [cv2.IMWRITE_JPEG_QUALITY, 80]):
+                raise OSError("thumbnail image could not be written")
             return True
         except Exception as e:
             last_err = e
@@ -119,20 +132,83 @@ def fetch_thumb(loc, W, H, d):
     raise last_err
 
 
+def _source_vector(value, components):
+    """Keep only complete, finite coordinates actually supplied by Matterport."""
+    if not isinstance(value, dict):
+        return None
+    if not all(isinstance(value.get(k), (int, float)) and not isinstance(value[k], bool)
+               and math.isfinite(value[k]) for k in components):
+        return None
+    return {k: value[k] for k in components}
+
+
+def _file_sha256(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _existing_provenance(d, model_id, already):
+    """Retain proven exact downloads only; filenames never verify legacy files."""
+    try:
+        old = json.loads((d / "provenance.json").read_text())
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(old, dict) or old.get("schema") != PROVENANCE_SCHEMA or old.get("model_id") != model_id:
+        return {}
+    images = old.get("images")
+    if not isinstance(images, dict):
+        return {}
+    retained = {}
+    for sweep_id in already:
+        record = images.get(sweep_id)
+        if (not isinstance(record, dict) or record.get("source") != "matterport-skybox"
+                or record.get("model_id") != model_id or record.get("sweep_id") != sweep_id
+                or record.get("source_sweep_id") != sweep_id or record.get("cubemap_face") != 1
+                or record.get("url") != f"thumbs/{sweep_id}.jpg"):
+            continue
+        try:
+            if record.get("sha256") != _file_sha256(d / f"{sweep_id}.jpg"):
+                continue
+        except OSError:
+            continue
+        retained[sweep_id] = dict(record, direction_verified=False)
+    return retained
+
+
+def _source_provenance(loc, node, model_id, path):
+    sweep_id = loc["id"]
+    record = {"url": f"thumbs/{sweep_id}.jpg", "source": "matterport-skybox",
+              "model_id": model_id, "sweep_id": sweep_id, "source_sweep_id": sweep_id,
+              "cubemap_face": 1, "direction_verified": False, "sha256": _file_sha256(path)}
+    if node.get("floor"):
+        record["floor_id"] = node["floor"]
+    mp_floor = (loc.get("floor") or {}).get("id")
+    if mp_floor:
+        record["matterport_floor_id"] = mp_floor
+    pano = loc.get("pano") or {}
+    for field, source, components in (("location_position", loc.get("position"), "xyz"),
+                                       ("pano_position", pano.get("position"), "xyz"),
+                                       ("pano_rotation", pano.get("rotation"), "xyzw")):
+        value = _source_vector(source, components)
+        if value is not None:
+            record[field] = value
+    return record
+
+
+def _write_outputs(ctx, d, model_id, done, provenance):
+    ctx.write_json(d / "index.json", sorted(done))
+    ctx.write_json(d / "provenance.json", {"schema": PROVENANCE_SCHEMA, "model_id": model_id,
+                                           "images": {key: provenance[key] for key in sorted(provenance)}})
+
+
 def run(ctx):
     d = ctx.o("thumbs"); d.mkdir(exist_ok=True)
+    model_id = ctx.cfg.get("matterport_model_id")
     if not ctx.cfg["thumbs"].get("enabled", True):
-        ctx.write_json(d / "index.json", []); return {"enabled": False}
+        _write_outputs(ctx, d, model_id, set(), {}); return {"enabled": False}
     pois = ctx.read_json(ctx.o("pois.json"))["pois"]; nav = ctx.read_json(ctx.o("nav_graph.json"))
     kinds = {n["id"]: n["kind"] for n in nav["nodes"]}
 
-    # sweep -> directly-linked sweep neighbours, for the neighbour-sweep fallback below.
-    neighbours = {}
-    for e in nav["edges"]:
-        u, v = e["u"], e["v"]
-        if kinds.get(u) == "sweep" and kinds.get(v) == "sweep":
-            neighbours.setdefault(u, set()).add(v)
-            neighbours.setdefault(v, set()).add(u)
+    nodes = {n["id"]: n for n in nav["nodes"]}
 
     want = {p["nearest_node"] for p in pois if kinds.get(p["nearest_node"]) == "sweep"}
     for e in nav["edges"]:
@@ -144,13 +220,14 @@ def run(ctx):
     W, H = ctx.cfg["thumbs"].get("size", [320, 192])
     already = {p.stem for p in d.glob("*.jpg")}
     done = set(already)
+    provenance = _existing_provenance(d, model_id, already)
     pending = want - already
 
     try:
-        locs = gql(Q, {"id": ctx.cfg["matterport_model_id"]})["data"]["model"]["locations"]
+        locs = gql(Q, {"id": model_id})["data"]["model"]["locations"]
     except Exception as e:
         ctx.warn(f"skybox query failed: {e}")
-        ctx.write_json(d / "index.json", sorted(done))
+        _write_outputs(ctx, d, model_id, done, provenance)
         return {"thumbs": len(done), "wanted": len(want), "reused": len(already)}
     by_id = {l["id"]: l for l in locs}
 
@@ -161,28 +238,15 @@ def run(ctx):
             failed.append(loc_id); continue
         try:
             if fetch_thumb(loc, W, H, d):
+                provenance[loc_id] = _source_provenance(loc, nodes.get(loc_id, {}), model_id, d / f"{loc_id}.jpg")
                 done.add(loc_id)
             else:
                 failed.append(loc_id)
         except Exception as e:
             ctx.warn(f"thumb {loc_id}: {e}"); failed.append(loc_id)
 
-    # A sweep that still has no photo of its own borrows the nearest sweep's thumbnail
-    # (one hop in the nav graph) rather than leaving that POI/stair with nothing at all.
-    backfilled = 0
-    for loc_id in failed:
-        if loc_id in done:
-            continue
-        for nb in neighbours.get(loc_id, ()):
-            if nb in done:
-                try:
-                    (d / f"{loc_id}.jpg").write_bytes((d / f"{nb}.jpg").read_bytes())
-                    done.add(loc_id); backfilled += 1
-                except Exception as e:
-                    ctx.warn(f"thumb fallback {loc_id} <- {nb}: {e}")
-                break
-
-    ctx.write_json(d / "index.json", sorted(done))
+    _write_outputs(ctx, d, model_id, done, provenance)
     return {"thumbs": len(done), "wanted": len(want), "reused": len(already),
-            "new": len(done) - len(already) - backfilled, "neighbour_fallback": backfilled,
+            "new": len(done) - len(already), "neighbour_fallback": 0,
+            "missing": len(failed), "exact_source_provenance": len(provenance),
             "live_poi_sweeps": len(live_ids)}

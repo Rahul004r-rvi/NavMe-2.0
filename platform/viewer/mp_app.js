@@ -136,6 +136,94 @@
       }).catch(e => console.warn("[navmesh] not available:", e.message || e));
       return navPromise;
     }
+
+    // Guidance points come from Recast's floor surface, not from a panorama's
+    // camera. Keep their exact route association for image resolution without
+    // changing the legacy instructions or treating a nearby sweep as evidence.
+    function attachRouteImageContexts(r) {
+      const path = Array.isArray(r.path) ? r.path : [];
+      const same = (a, b) => a && b && ["x", "y", "z"].every(k =>
+        Number.isFinite(a[k]) && Number.isFinite(b[k]) && Math.abs(a[k] - b[k]) <= 0.00001);
+      const modelPoint = p => p && [p.x, p.y, p.z].every(Number.isFinite)
+        ? { x:p.x, y:-p.z, z:p.y } : null;
+      const modelId = String(CFG.matterport_model_id || CFG.model_id || "");
+      const building = slug();
+      let hash = 2166136261;
+      const geometry = path.map(p => [p.x, p.y, p.z].join(",")).join(";");
+      for (let i = 0; i < geometry.length; i++) hash = Math.imul(hash ^ geometry.charCodeAt(i), 16777619);
+      const routeKey = (hash >>> 0).toString(16);
+      function pathIndex(step) {
+        if (!step || !step.point) return -1;
+        if (Number.isInteger(step.i) && same(path[step.i], step.point)) return step.i;
+        // guidance's walk i denotes the preceding segment; its point is the end.
+        if (step.type === "walk" && Number.isInteger(step.i) && same(path[step.i + 1], step.point)) return step.i + 1;
+        const matches = [];
+        path.forEach((p, i) => { if (same(p, step.point)) matches.push(i); });
+        return matches.length === 1 ? matches[0] : -1;
+      }
+      function routeFloorCandidate(i) {
+        const p = path[i], node = (r.navPath || r.nodes || [])[i];
+        if (!p || !node || !same(modelPoint(p), node)) return null;
+        return ordered.some(f => f.id === node.floor) ? node.floor : null;
+      }
+      function segmentKind(i) {
+        if (!path[i] || !path[i + 1]) return null;
+        const a = path[i], b = path[i + 1], rise = b.y - a.y;
+        const pitch = Math.atan2(Math.abs(rise), Math.hypot(b.x - a.x, b.z - a.z)) * 180 / Math.PI;
+        return { type:pitch >= 75 ? "elevator" : pitch >= 35 ? "stairs" : "flat", up:rise > 0 };
+      }
+      r.image_context = { building_slug:building, model_id:modelId || null,
+        route_key:routeKey, coordinate_space:"navme-z-up", path_coordinate_space:"matterport-y-up",
+        geometry_source:r.source || null, path_vertex_count:path.length,
+        floor_basis:"route-path-height-classification-unverified" };
+      (r.instructions || []).forEach((instruction, index) => {
+        const step = (r.steps || [])[index];
+        const pi = step && step.type === instruction.type ? pathIndex(step) : -1;
+        const point = pi >= 0 ? modelPoint(path[pi]) : null;
+        let start = pi, end = pi >= 0 && pi + 1 < path.length ? pi + 1 : pi;
+        if (instruction.type === "arrive" || instruction.type === "walk") start = pi > 0 ? pi - 1 : pi;
+        if (instruction.type === "arrive" || instruction.type === "walk") end = pi;
+        const transition = /^(stairs(?:_up|_down)?|elevator|level)$/.test(instruction.type);
+        if (transition && pi >= 0) {
+          const first = segmentKind(pi);
+          if (first && first.type !== "flat") {
+            while (end + 1 < path.length) {
+              const next = segmentKind(end);
+              if (!next || next.type !== first.type || next.up !== first.up) break;
+              end++;
+            }
+          }
+        }
+        const travelFrom = instruction.type === "arrive" || instruction.type === "walk" ? start : pi;
+        const travelTo = instruction.type === "arrive" || instruction.type === "walk" ? pi : Math.min(pi + 1, path.length - 1);
+        const fromPoint = travelFrom >= 0 ? modelPoint(path[travelFrom]) : null;
+        const toPoint = travelTo >= 0 ? modelPoint(path[travelTo]) : null;
+        const hasHeading = fromPoint && toPoint && Math.hypot(toPoint.x - fromPoint.x, toPoint.y - fromPoint.y) > 0.00001;
+        instruction.image_context = {
+          ...r.image_context,
+          step_id:[building, modelId, routeKey, index, instruction.type, pi].join(":"),
+          instruction_index:index, type:instruction.type,
+          path_index:pi >= 0 ? pi : null, segment_index:start >= 0 ? start : null,
+          segment_start_index:start >= 0 ? start : null, segment_end_index:end >= 0 ? end : null,
+          point, segment_start:start >= 0 ? modelPoint(path[start]) : null,
+          segment_end:end >= 0 ? modelPoint(path[end]) : null,
+          route_start:modelPoint(path[0]), route_end:modelPoint(path[path.length - 1]),
+          travel_from:fromPoint, travel_to:toPoint, travel_direction_verified:!!hasHeading,
+          floor_id:null, source_floor_id:null, destination_floor_id:null,
+          route_floor_candidate:routeFloorCandidate(pi),
+          route_source_floor_candidate:routeFloorCandidate(start),
+          route_destination_floor_candidate:routeFloorCandidate(end),
+          // Height-derived NavMe levels do not prove the physical panorama floor.
+          // guidance.sweep is itself a nearest-sweep guess and is not authoritative.
+          floor_verified:false, sweep_id:null, sweep_reference_verified:false,
+          sweep_candidate:step && step.sweep || null,
+          association:point ? "exact-path-vertex" : "unresolved",
+          reason:!point ? "unresolved-path-vertex" : !modelId ? "missing-model-id"
+            : !hasHeading ? "travel-direction-unverified" : "floor-unverified"
+        };
+      });
+    }
+
     function route(fromKey, toKey, opts) {
       opts = opts || {};
       const ticket = opts._ticket || ++requestId;
@@ -168,6 +256,7 @@
       r.fromName=from.name; r.toName=to.name; r.toPoi=to.id;
       if (!r.instructions) r.instructions=(r.steps||[]).map(s=>({text:s.text,type:s.type,arrow:s.arrow,dir:s.dir,turn_deg:s.turn_deg,
         pt:s.point?{x:s.point.x,y:-s.point.z,z:s.point.y,floor:s.floor}:null,icon:s.arrow,dist:s.dist_m||0,sweep:s.sweep}));
+      attachRouteImageContexts(r);
       lastRoute=r; window.wf.lastRoute=r; if(window.wf.onRoute) window.wf.onRoute(r); return r;
     }
 

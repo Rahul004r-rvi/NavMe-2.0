@@ -567,7 +567,13 @@ function wfDbg(level, source, message, meta) {
           if (nid) neighbours.push(nid);
         }
       }
-      out.push({ sid, position: { x, y, z }, neighbours });
+      const floorInfo = sw.floorInfo || {};
+      out.push({ sid, position: { x, y, z }, neighbours,
+        aliases: Array.from(new Set([sw.id, sw.sid, sw.uuid].filter(v => typeof v === "string" && v))),
+        native_floor_id: typeof floorInfo.id === "string" ? floorInfo.id : null,
+        native_floor_sequence: Number.isFinite(floorInfo.sequence) ? floorInfo.sequence
+          : Number.isFinite(sw.floor) ? sw.floor : null
+      });
     }
     return out;
   }
@@ -606,6 +612,212 @@ function wfDbg(level, source, message, meta) {
       x: s.position.x, y: -s.position.z, z: s.position.y,
       floor: sweepFloorId(s.position.y)
     }));
+  }
+
+  // Step images may only be captured from the existing, stationary Inside view.
+  // Renderer.takeScreenShot has no offscreen camera/sweep parameter: never move
+  // the visitor's camera, initialize an SDK, or create an iframe for coverage.
+  const stepImageSessions = new WeakMap();
+  const STEP_IMAGE_LIMIT = 16, STEP_IMAGE_BYTES = 3 * 1024 * 1024;
+  const stepImageMissing = reason => ({ status: "missing", reason });
+  function stepImageSession(sdk) {
+    let session = stepImageSessions.get(sdk);
+    if (!session) {
+      session = { pending: new Map(), images: new Map(), bytes: 0 };
+      stepImageSessions.set(sdk, session);
+    }
+    return session;
+  }
+  function stepImagePoint(p) {
+    return p && ["x", "y", "z"].every(k => typeof p[k] === "number" && Number.isFinite(p[k]))
+      ? { x: p.x, y: p.y, z: p.z } : null;
+  }
+  function stepImageDistance(a, b) { return Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z); }
+  function stepImageAngle(a, b) { return Math.abs(((a - b + 540) % 360 + 360) % 360 - 180); }
+  function stepImagePose(value) {
+    const p = value && stepImagePoint(value.position), r = value && value.rotation;
+    if (!p || !r || !Number.isFinite(r.x) || !Number.isFinite(r.y) || typeof value.sweep !== "string") return null;
+    return { sweep_id: value.sweep, position: sdkToModel(p), rotation: { pitch: r.x, yaw: r.y }, mode: value.mode,
+      projection: value.projection ? Array.from(value.projection) : null };
+  }
+  function stepImagePoseMoved(a, b) {
+    if (!a || !b || a.sweep_id !== b.sweep_id || a.mode !== b.mode
+        || stepImageDistance(a.position, b.position) > 0.01
+        || stepImageAngle(a.rotation.pitch, b.rotation.pitch) > 0.1
+        || stepImageAngle(a.rotation.yaw, b.rotation.yaw) > 0.1) return true;
+    const ap = a.projection, bp = b.projection;
+    return !!(ap && bp && (ap.length !== bp.length || ap.some((v, i) => Math.abs(v - bp[i]) > 0.00001)));
+  }
+  function stepImageIdentity() {
+    const wf = window.WF || {}, cfg = wf.cfg || {};
+    return { building_slug: (wf.building && wf.building.slug) || cfg.slug || "", model_id: modelId };
+  }
+  function stepImageGuard(sdk) {
+    const epoch = viewerEpoch, identity = viewerIdentity(), model = modelId;
+    return () => mpSdk === sdk && viewerEpoch === epoch && modelId === model && viewerIdentity() === identity;
+  }
+  function stopStepImageSubscription(sub) {
+    try {
+      if (typeof sub === "function") sub();
+      else if (sub && sub.cancel) sub.cancel();
+      else if (sub && sub.unsubscribe) sub.unsubscribe();
+    } catch (_) {}
+  }
+  function stepImageMonitor(sdk) {
+    const state = { pose: null, sweep: null, phase: null, moved: false }, subscriptions = [], readers = [];
+    const observe = (observable, accept) => {
+      if (!observable) return;
+      const refresh = () => { try { if (typeof observable.getLatest === "function") accept(observable.getLatest()); } catch (_) {} };
+      readers.push(refresh); refresh();
+      try { if (typeof observable.subscribe === "function") subscriptions.push(observable.subscribe(accept)); } catch (_) {}
+    };
+    observe(sdk.Camera && sdk.Camera.pose, value => {
+      const next = stepImagePose(value);
+      if (state.pose && stepImagePoseMoved(state.pose, next)) state.moved = true;
+      state.pose = next;
+    });
+    observe(sdk.Sweep && sdk.Sweep.current, value => {
+      const ids = value && [value.id, value.sid, value.uuid].filter(v => typeof v === "string" && v);
+      const next = ids && ids.length ? { ids, enabled: value.enabled, native_floor_id: value.floorInfo && value.floorInfo.id } : null;
+      if (state.sweep && (!next || !next.ids.some(id => state.sweep.ids.includes(id)))) state.moved = true;
+      state.sweep = next;
+    });
+    observe(sdk.App && sdk.App.state, value => {
+      const phase = value && value.phase;
+      if (state.phase && phase !== state.phase) state.moved = true;
+      state.phase = phase || null;
+    });
+    return { state, refresh() { readers.forEach(read => read()); }, stop() { subscriptions.forEach(stopStepImageSubscription); } };
+  }
+  async function stepImageMetadata(sdk, current) {
+    if (!sdk.Model || typeof sdk.Model.getDetails !== "function") return stepImageMissing("model_unverified");
+    let details, sweeps;
+    try { [details, sweeps] = await Promise.all([sdk.Model.getDetails(), rtReadSweeps(sdk)]); }
+    catch (_) { return stepImageMissing("model_unverified"); }
+    if (!current()) return stepImageMissing("stale_context");
+    if (!details || typeof details.sid !== "string") return stepImageMissing("model_unverified");
+    if (details.sid !== modelId) return stepImageMissing("model_mismatch");
+    if (!sweeps.length) return stepImageMissing("missing_sweep_data");
+    return { status: "verified", sweeps: sweeps.map(sw => {
+      const position = sdkToModel(sw.position), floor = sweepFloorId(sw.position.y);
+      return { id: sw.sid, sweep_id: sw.sid, aliases: sw.aliases || [sw.sid], position,
+        x: position.x, y: position.y, z: position.z,
+        floor_id: floor == null ? null : String(floor),
+        native_floor_id: sw.native_floor_id, native_floor_sequence: sw.native_floor_sequence };
+    }) };
+  }
+  async function getStepImageContext() {
+    const sdk = mpSdk;
+    if (!sdk) return stepImageMissing("sdk_unavailable");
+    const current = stepImageGuard(sdk), monitor = stepImageMonitor(sdk);
+    try {
+      const metadata = await stepImageMetadata(sdk, current);
+      if (metadata.status !== "verified") return metadata;
+      monitor.refresh();
+      const pose = monitor.state.pose, sw = monitor.state.sweep;
+      const active = pose && sw && metadata.sweeps.find(s => s.aliases.includes(pose.sweep_id)
+        && s.aliases.some(id => sw.ids.includes(id)));
+      return { status: "verified", ...stepImageIdentity(), generation: viewerEpoch,
+        coordinate_system: "navme-z-up", sweeps: metadata.sweeps, pose,
+        activeSweep: active ? active.sweep_id : null, position: pose ? pose.position : null,
+        capture_supported: !!(sdk.Renderer && typeof sdk.Renderer.takeScreenShot === "function") };
+    } finally { monitor.stop(); }
+  }
+  function stepImageBinding(value) {
+    if (!value || typeof value.building_slug !== "string" || !value.building_slug
+        || typeof value.model_id !== "string" || !value.model_id
+        || typeof value.sweep_id !== "string" || !value.sweep_id
+        || typeof value.floor_id !== "string" || !value.floor_id
+        || !stepImagePoint(value.position) || !value.rotation
+        || !Number.isFinite(value.rotation.pitch) || Math.abs(value.rotation.pitch) > 90
+        || !Number.isFinite(value.rotation.yaw)) return null;
+    return { building_slug: value.building_slug, model_id: value.model_id, sweep_id: value.sweep_id,
+      floor_id: value.floor_id, position: stepImagePoint(value.position),
+      rotation: { pitch: value.rotation.pitch, yaw: ((value.rotation.yaw + 540) % 360 + 360) % 360 - 180 } };
+  }
+  function stepImagePoseMatches(pose, binding, sweep) {
+    return pose && ["mode.inside", "mode.panorama", "inside", "panorama"].includes(pose.mode)
+      && sweep.aliases.includes(pose.sweep_id)
+      && stepImageDistance(pose.position, binding.position) <= 0.1
+      && stepImageAngle(pose.rotation.pitch, binding.rotation.pitch) <= 5
+      && stepImageAngle(pose.rotation.yaw, binding.rotation.yaw) <= 5;
+  }
+  async function captureStepImage(value) {
+    const binding = stepImageBinding(value);
+    if (!binding) return stepImageMissing("invalid_binding");
+    const sdk = mpSdk;
+    if (!sdk) return stepImageMissing("sdk_unavailable");
+    const session = stepImageSession(sdk), key = JSON.stringify(binding), epoch = viewerEpoch;
+    const pendingKey = epoch + ":" + key;
+    if (session.pending.has(pendingKey)) return session.pending.get(pendingKey);
+    const task = captureStepImageCurrent(sdk, binding, session, key);
+    session.pending.set(pendingKey, task);
+    try { return await task; }
+    finally { if (session.pending.get(pendingKey) === task) session.pending.delete(pendingKey); }
+  }
+  async function captureStepImageCurrent(sdk, binding, session, key) {
+    const current = stepImageGuard(sdk), identity = stepImageIdentity();
+    if (binding.building_slug !== identity.building_slug || binding.model_id !== identity.model_id) return stepImageMissing("model_mismatch");
+    if (!sdk.Renderer || typeof sdk.Renderer.takeScreenShot !== "function") return stepImageMissing("capture_unsupported");
+    if (playing || activeCameraMove) return stepImageMissing("viewer_moving");
+    const monitor = stepImageMonitor(sdk), focus = focusGen, walk = walkGen;
+    const stillCurrent = () => current() && focusGen === focus && walkGen === walk;
+    let timer = null;
+    try {
+      const metadata = await stepImageMetadata(sdk, stillCurrent);
+      if (metadata.status !== "verified") return metadata;
+      const sweep = metadata.sweeps.find(sw => sw.aliases.includes(binding.sweep_id));
+      if (!sweep) return stepImageMissing("missing_sweep");
+      if (!sweep.floor_id) return stepImageMissing("unknown_floor");
+      if (sweep.floor_id !== binding.floor_id) return stepImageMissing("floor_mismatch");
+      if (stepImageDistance(sweep.position, binding.position) > 0.1) return stepImageMissing("pose_mismatch");
+      const validate = () => {
+        monitor.refresh();
+        if (!stillCurrent()) return "stale_context";
+        const state = monitor.state;
+        if (state.moved || playing || activeCameraMove) return "viewer_moving";
+        if (!state.pose) return "pose_unavailable";
+        // Sweep.current's empty sid is the documented transition signal. Its
+        // enabled flag also prevents Model.getData's older catalog from blessing
+        // a subsequently disabled scan.
+        if (!state.sweep || state.sweep.enabled !== true || !sweep.aliases.some(id => state.sweep.ids.includes(id))) return "viewer_moving";
+        if (state.phase !== (((sdk.App && sdk.App.Phase) || {}).PLAYING || "appphase.playing")) return "viewer_not_ready";
+        if (!stepImagePoseMatches(state.pose, binding, sweep)) return "pose_mismatch";
+        return null;
+      };
+      let failure = validate();
+      if (failure) return stepImageMissing(failure);
+      await new Promise(resolve => { timer = setTimeout(resolve, 120); });
+      clearTimeout(timer); timer = null;
+      failure = validate();
+      if (failure) return stepImageMissing(failure);
+      if (session.images.has(key)) {
+        const cached = session.images.get(key);
+        session.images.delete(key); session.images.set(key, cached);
+        return { status: "verified", image: { ...cached.image, position: { ...cached.image.position }, rotation: { ...cached.image.rotation } } };
+      }
+      const before = monitor.state.pose;
+      const url = await Promise.race([
+        sdk.Renderer.takeScreenShot({ width: 480, height: 270 }, { mattertags: false, sweeps: false }),
+        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("capture_timeout")), 3000); })
+      ]);
+      clearTimeout(timer); timer = null;
+      failure = validate();
+      if (failure) return stepImageMissing(failure);
+      if (stepImagePoseMoved(before, monitor.state.pose)) return stepImageMissing("viewer_moving");
+      if (typeof url !== "string" || url.length > 512 * 1024 || !/^data:image\/jpeg;base64,[A-Za-z0-9+/]+={0,2}$/.test(url)) return stepImageMissing("capture_failed");
+      const pose = monitor.state.pose;
+      const image = { url, ...identity, sweep_id: binding.sweep_id, floor_id: sweep.floor_id,
+        position: { ...pose.position }, rotation: { ...pose.rotation }, source: "sdk-current-view", verified: true };
+      const bytes = url.length * 2;
+      session.images.set(key, { image, bytes }); session.bytes += bytes;
+      while (session.images.size > STEP_IMAGE_LIMIT || session.bytes > STEP_IMAGE_BYTES) {
+        const oldest = session.images.keys().next().value;
+        session.bytes -= session.images.get(oldest).bytes; session.images.delete(oldest);
+      }
+      return { status: "verified", image: { ...image, position: { ...image.position }, rotation: { ...image.rotation } } };
+    } catch (_) { return stepImageMissing(stillCurrent() ? "capture_failed" : "stale_context"); }
+    finally { clearTimeout(timer); monitor.stop(); }
   }
 
   async function rtReadSweepsUncached(sdk) {
@@ -2654,6 +2866,7 @@ function wfDbg(level, source, message, meta) {
   }
 
   async function open(route) {
+    cancelPickOnMap();
     viewerTrace("navigation", {action:"route-preview"});
     const requestedOpen = ++openGen;
     // A preview requested during startup joins the existing model load. It
@@ -2811,6 +3024,7 @@ function wfDbg(level, source, message, meta) {
   }
 
   function close() {
+    cancelPickOnMap();
     viewerTrace("navigation", {action:"route-exit"});
     openGen++;
     cancelPlayback();
@@ -2859,6 +3073,7 @@ function wfDbg(level, source, message, meta) {
       viewerTrace("navigation", {action:"background-open", reason:"reuse"});
       return backgroundSession.promise;
     }
+    cancelPickOnMap();
     const previous = backgroundSession;
     const session = {identity, epoch:++viewerEpoch, previousModel:previous ? previous.model : null,
       restore:retry && previous ? previous.pose : null, chromeReady:!!(window.WFStartup && window.WFStartup.chromeReady)};
@@ -2918,7 +3133,9 @@ function wfDbg(level, source, message, meta) {
       const building = (window.WF && window.WF.building) || {};
       const slug = String(building.slug || cfg.slug || cfg.building || "").toLowerCase();
       const mobile = !!(window.matchMedia && window.matchMedia("(max-width: 900px), (pointer: coarse)").matches);
-      return mobile && slug === "uncc-main-campus";
+      // Both campus twins use native startup on phones. Avoid loading/framing
+      // the whole dollhouse before visitors start selecting places and routes.
+      return mobile && (slug === "uncc-main-campus" || slug === "gcu");
     })();
     const url = showcaseUrl(applicationKey, null, { nativeStartup });
     const iframe = $("mpFrame");
@@ -3251,7 +3468,11 @@ function wfDbg(level, source, message, meta) {
     return el;
   }
 
-  let pickGen = 0;
+  let pickGen = 0, activePick = null;
+  function cancelPickOnMap() {
+    pickGen++;
+    if (activePick) activePick.finish(null);
+  }
   /** "Pick on map" for MP mode: switch to Dollhouse, let the user aim (orbit/pan — native
    *  Showcase dollhouse controls, untouched), track Pointer.intersection for the live 3D
    *  point under the pointer, and on confirm walk there (same focusAt() FLY used by
@@ -3261,39 +3482,65 @@ function wfDbg(level, source, message, meta) {
    *  itself just tracks hover/drag continuously) — hence the explicit confirm button
    *  instead of a single tap-to-commit gesture. */
   async function pickOnMap() {
-    if (!mpSdk) return null;
-    const gen = ++pickGen;
+    cancelPickOnMap();
+    const gen = pickGen, sdk = mpSdk;
+    if (!sdk) return null;
     const bar = ensurePickOverlay();
     const goBtn = $("mpPickGo"), cancelBtn = $("mpPickCancel");
     if (!bar || !goBtn || !cancelBtn) return null;
-    try {
-      const Mode = mpSdk.Mode;
-      if (Mode && Mode.moveTo && Mode.Mode) {
-        const dh = Mode.Mode.DOLLHOUSE || Mode.Mode.Dollhouse || "mode.dollhouse";
-        await Mode.moveTo(dh, { transition: (Mode.Transition && Mode.Transition.FLY) || undefined });
-      }
-    } catch (e) { console.warn("[MpBackground] pickOnMap dollhouse moveTo failed", e && (e.message || e)); }
-    if (gen !== pickGen) return null;
-    let lastHit = null;
-    const sub = mpSdk.Pointer.intersection.subscribe((d) => {
-      if (d && d.object === "intersectedobject.model") lastHit = d;
-    });
-    bar.hidden = false;
-    goBtn.disabled = true;
-    const stopWatch = setInterval(() => { goBtn.disabled = !lastHit; }, 150);
     const result = await new Promise((resolve) => {
-      goBtn.onclick = () => resolve(lastHit);
-      cancelBtn.onclick = () => resolve(null);
+      let sub = null, timer = null, settled = false, lastHit = null;
+      const session = { finish: null };
+      activePick = session;
+      const current = () => activePick === session && gen === pickGen && sdk === mpSdk;
+      const confirm = () => session.finish(lastHit), cancel = () => session.finish(null);
+      session.finish = (hit) => {
+        if (settled) return;
+        settled = true;
+        clearInterval(timer);
+        try {
+          if (typeof sub === "function") sub();
+          else if (sub && sub.cancel) sub.cancel();
+          else if (sub && sub.unsubscribe) sub.unsubscribe();
+        } catch (_) { /* SDK cleanup is best effort. */ }
+        if (goBtn.onclick === confirm) goBtn.onclick = null;
+        if (cancelBtn.onclick === cancel) cancelBtn.onclick = null;
+        if (activePick === session) { activePick = null; bar.hidden = true; }
+        resolve(hit);
+      };
+      // Cancellation settles this request even if an SDK transition is still pending.
+      void (async () => {
+        try {
+          const Mode = sdk.Mode;
+          if (Mode && Mode.moveTo && Mode.Mode) {
+            const dh = Mode.Mode.DOLLHOUSE || Mode.Mode.Dollhouse || "mode.dollhouse";
+            await Mode.moveTo(dh, { transition: (Mode.Transition && Mode.Transition.FLY) || undefined });
+          }
+          if (!current()) { session.finish(null); return; }
+          sub = sdk.Pointer.intersection.subscribe((d) => {
+            if (current() && d && d.object === "intersectedobject.model") lastHit = d;
+          });
+          if (!current()) { session.finish(null); return; }
+          bar.hidden = false;
+          goBtn.disabled = !lastHit;
+          goBtn.onclick = confirm;
+          cancelBtn.onclick = cancel;
+          timer = setInterval(() => {
+            if (!current()) { session.finish(null); return; }
+            goBtn.disabled = !lastHit;
+          }, 150);
+        } catch (e) {
+          console.warn("[MpBackground] map picker failed", e && (e.message || e));
+          session.finish(null);
+        }
+      })();
     });
-    clearInterval(stopWatch);
-    try { sub.cancel(); } catch (_) { /* ignore */ }
-    bar.hidden = true;
-    if (gen !== pickGen || !result) return null;
+    if (gen !== pickGen || sdk !== mpSdk || !result) return null;
     const modelPt = sdkToModel(result.position);
     if (!modelPt) return null;
     modelPt.floorIndex = result.floorIndex;
     try { await focusAt(modelPt, null); } catch (_) { /* ignore — point is still valid even if the fly-there animation fails */ }
-    return modelPt;
+    return gen === pickGen && sdk === mpSdk ? modelPt : null;
   }
 
   // ── "Start Preview" walkthrough: the exact same sweep-by-sweep engine Tour interior
@@ -3305,6 +3552,7 @@ function wfDbg(level, source, message, meta) {
   /** Prepare the module's sweepIds/sweepNodes/distances for `route`, reusing mpSdk
    *  that's already connected in mp background mode (see showBackground()). */
   async function prepareWalk(route) {
+    cancelPickOnMap();
     tourNavSteps = Array.isArray(route && route._navSteps) ? route._navSteps : [];
     destName = (route && route._destName) || null;
     fromName = (route && route._fromName) || null;
@@ -3428,6 +3676,6 @@ function wfDbg(level, source, message, meta) {
     open, close, showBackground, recoverBackground, focusAt, focusPoi, setFloor, zoomBy, resetView, toggleHomeView,
     prepareWalk, nearestIndexForPoint, walkToIndex, cancelWalkTo, moveTo,
     currentSweepIndex, totalSweepStops, sweepPointAt, pickOnMap, getLiveConnection,
-    thumbnailSweepNodes, pauseForPlanNavigation
+    thumbnailSweepNodes, pauseForPlanNavigation, getStepImageContext, captureStepImage
   };
 })();
